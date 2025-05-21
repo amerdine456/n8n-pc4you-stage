@@ -1,0 +1,810 @@
+import {
+  INodeType,
+  INodeTypeDescription,
+  IExecuteFunctions,
+  INodeExecutionData,
+  NodeApiError,
+  IDataObject,
+  IHttpRequestMethods,
+} from 'n8n-workflow';
+
+export function cleanEmptyObjects(obj: any): any | undefined {
+  if (obj === null || obj === undefined || obj === '') return undefined;
+  if (Array.isArray(obj)) {
+    const cleanedArray = obj.map(item => (typeof item === 'object' ? cleanEmptyObjects(item) : item)).filter(item => item !== undefined);
+    return cleanedArray.length > 0 ? cleanedArray : undefined;
+  }
+  if (typeof obj === 'object') {
+    const newObj: IDataObject = {};
+    for (const key in obj) {
+      if (!Object.prototype.hasOwnProperty.call(obj, key)) continue;
+      const cleanedValue = typeof obj[key] === 'object' ? cleanEmptyObjects(obj[key]) : obj[key];
+      if (cleanedValue !== undefined) newObj[key] = cleanedValue;
+    }
+    return Object.keys(newObj).length > 0 ? newObj : undefined;
+  }
+  return obj;
+}
+
+export function filterFields(obj: IDataObject | undefined, keys: string[]): IDataObject {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return {};
+  if (!keys.length) return obj;
+  const filtered: IDataObject = {};
+  for (const key of keys) {
+    if (Object.prototype.hasOwnProperty.call(obj, key)) filtered[key] = obj[key];
+  }
+  return filtered;
+}
+
+export async function fetchLinkedData(
+  links: Array<{ rel: string; href: string }>,
+  sessionToken: string,
+  apiUrl: string,
+  appToken: string,
+  helpers: IExecuteFunctions['helpers'],
+  depth = 1,
+  maxDepth = 5,
+  fetchedUrls = new Map<string, number>()
+): Promise<IDataObject> {
+  const linkData: IDataObject = {};
+  if (depth > maxDepth) return linkData;
+
+  const MAX_REVISITS = 2;
+
+  for (const link of links) {
+    const match = link.href.match(/apirest\.php(.*)/);
+    if (!match) continue;
+
+    const relativePath = match[1];
+    const modifiedUrl = `${apiUrl}${relativePath}`;
+    const visitCount = fetchedUrls.get(modifiedUrl) || 0;
+
+    if (visitCount >= MAX_REVISITS) continue;
+
+    fetchedUrls.set(modifiedUrl, visitCount + 1);
+
+    try {
+      const response = await helpers.request({
+        method: 'GET' as IHttpRequestMethods,
+        url: modifiedUrl,
+        headers: { 'app-token': appToken, 'session-token': sessionToken },
+        json: true,
+      });
+
+      const resultData: IDataObject = { ...response };
+
+      if (response?.links && Array.isArray(response.links) && depth < maxDepth) {
+        const directLinks = response.links.filter((l: any): l is { rel: string; href: string } =>
+          typeof l?.rel === 'string' && typeof l?.href === 'string');
+
+        if (directLinks.length > 0) {
+          const nestedLinkedData = await fetchLinkedData(
+            directLinks,
+            sessionToken,
+            apiUrl,
+            appToken,
+            helpers,
+            depth + 1,
+            maxDepth,
+            fetchedUrls
+          );
+          Object.assign(resultData, nestedLinkedData);
+        }
+      }
+
+      if (link.rel.startsWith('Item_')) {
+        const deviceType = link.rel.replace('Item_', '');
+        let deviceId = response.items_id || response.item_id || response.id;
+        if (Array.isArray(response) && response.length > 0 && response[0]?.id) deviceId = response[0].id;
+
+        let resolvedDeviceType = deviceType;
+        if (response.itemtype) resolvedDeviceType = response.itemtype;
+
+        if (deviceId && resolvedDeviceType) {
+          const deviceUrl = `${apiUrl}/${resolvedDeviceType}/${deviceId}`;
+          const deviceVisitCount = fetchedUrls.get(deviceUrl) || 0;
+
+          if (deviceVisitCount < MAX_REVISITS) {
+            fetchedUrls.set(deviceUrl, deviceVisitCount + 1);
+            try {
+              const deviceResponse = await helpers.request({
+                method: 'GET' as IHttpRequestMethods,
+                url: deviceUrl,
+                headers: { 'app-token': appToken, 'session-token': sessionToken },
+                json: true,
+              });
+
+              if (deviceResponse?.links && Array.isArray(deviceResponse.links) && depth < maxDepth) {
+                const deviceLinks = deviceResponse.links.filter((l: any): l is { rel: string; href: string } =>
+                  typeof l?.rel === 'string' && typeof l?.href === 'string');
+
+                if (deviceLinks.length > 0) {
+                  const deviceLinkedData = await fetchLinkedData(
+                    deviceLinks,
+                    sessionToken,
+                    apiUrl,
+                    appToken,
+                    helpers,
+                    depth + 1,
+                    maxDepth,
+                    fetchedUrls
+                  );
+                  resultData[resolvedDeviceType] = { ...deviceResponse, ...deviceLinkedData };
+                  resultData[resolvedDeviceType.toLowerCase()] = { ...deviceResponse, ...deviceLinkedData };
+                } else {
+                  resultData[resolvedDeviceType] = deviceResponse;
+                  resultData[resolvedDeviceType.toLowerCase()] = deviceResponse;
+                }
+              } else {
+                resultData[resolvedDeviceType] = deviceResponse;
+                resultData[resolvedDeviceType.toLowerCase()] = deviceResponse;
+              }
+            } catch (error) {
+              console.error(`Error fetching device data for ${deviceUrl}:`, error);
+            }
+          }
+        } else if (Array.isArray(response)) {
+          for (let i = 0; i < response.length; i++) {
+            const item = response[i];
+            if (!item || !item.id) continue;
+
+            const itemType = item.itemtype || deviceType;
+            const itemUrl = `${apiUrl}/${itemType}/${item.id}`;
+            const itemVisitCount = fetchedUrls.get(itemUrl) || 0;
+
+            if (itemVisitCount < MAX_REVISITS) {
+              fetchedUrls.set(itemUrl, itemVisitCount + 1);
+              try {
+                const itemResponse = await helpers.request({
+                  method: 'GET' as IHttpRequestMethods,
+                  url: itemUrl,
+                  headers: { 'app-token': appToken, 'session-token': sessionToken },
+                  json: true,
+                });
+
+                if (itemResponse?.links && Array.isArray(itemResponse.links) && depth < maxDepth) {
+                  const itemLinks = itemResponse.links.filter((l: any): l is { rel: string; href: string } =>
+                    typeof l?.rel === 'string' && typeof l?.href === 'string');
+
+                  const itemLinkedData = await fetchLinkedData(
+                    itemLinks,
+                    sessionToken,
+                    apiUrl,
+                    appToken,
+                    helpers,
+                    depth + 1,
+                    maxDepth,
+                    fetchedUrls
+                  );
+
+                  if (!resultData[itemType]) resultData[itemType] = [];
+                  if (!Array.isArray(resultData[itemType])) resultData[itemType] = [resultData[itemType]];
+                  (resultData[itemType] as IDataObject[]).push({ ...itemResponse, ...itemLinkedData });
+
+                  const lcType = itemType.toLowerCase();
+                  if (!resultData[lcType]) resultData[lcType] = [];
+                  if (!Array.isArray(resultData[lcType])) resultData[lcType] = [resultData[lcType]];
+                  (resultData[lcType] as IDataObject[]).push({ ...itemResponse, ...itemLinkedData });
+                } else {
+                  if (!resultData[itemType]) resultData[itemType] = [];
+                  if (!Array.isArray(resultData[itemType])) resultData[itemType] = [resultData[itemType]];
+                  (resultData[itemType] as IDataObject[]).push(itemResponse);
+
+                  const lcType = itemType.toLowerCase();
+                  if (!resultData[lcType]) resultData[lcType] = [];
+                  if (!Array.isArray(resultData[lcType])) resultData[lcType] = [resultData[lcType]];
+                  (resultData[lcType] as IDataObject[]).push(itemResponse);
+                }
+              } catch (error) {
+                console.error(`Error fetching item data for ${itemUrl}:`, error);
+              }
+            }
+          }
+        }
+      }
+
+      const referencedEntities = findEntityReferences(response);
+      for (const ref of referencedEntities) {
+        const refUrl = `${apiUrl}/${ref.type}/${ref.id}`;
+        const refVisitCount = fetchedUrls.get(refUrl) || 0;
+
+        if (refVisitCount < MAX_REVISITS) {
+          fetchedUrls.set(refUrl, refVisitCount + 1);
+          try {
+            const refResponse = await helpers.request({
+              method: 'GET' as IHttpRequestMethods,
+              url: refUrl,
+              headers: { 'app-token': appToken, 'session-token': sessionToken },
+              json: true,
+            });
+
+            if (refResponse?.links && Array.isArray(refResponse.links) && depth < maxDepth) {
+              const refLinks = refResponse.links.filter((l: any): l is { rel: string; href: string } =>
+                typeof l?.rel === 'string' && typeof l?.href === 'string');
+
+              if (refLinks.length > 0) {
+                const refEntityLinkedData = await fetchLinkedData(
+                  refLinks,
+                  sessionToken,
+                  apiUrl,
+                  appToken,
+                  helpers,
+                  depth + 1,
+                  maxDepth,
+                  fetchedUrls
+                );
+                resultData[ref.type] = { ...refResponse, ...refEntityLinkedData };
+                resultData[ref.type.toLowerCase()] = { ...refResponse, ...refEntityLinkedData };
+              } else {
+                resultData[ref.type] = refResponse;
+                resultData[ref.type.toLowerCase()] = refResponse;
+              }
+            } else {
+              resultData[ref.type] = refResponse;
+              resultData[ref.type.toLowerCase()] = refResponse;
+            }
+          } catch (error) {
+            console.error(`Error fetching referenced entity ${refUrl}:`, error);
+          }
+        }
+      }
+
+      if (link.rel.startsWith('Item_Device')) {
+        if (Array.isArray(response)) {
+          for (const item of response) {
+            if (!item || !item.id) continue;
+
+            let deviceType = '';
+            if (link.rel === 'Item_DeviceGraphicCard') deviceType = 'DeviceGraphicCard';
+            else deviceType = link.rel.replace('Item_', '');
+
+            const deviceId = item.devicegraphiccards_id || item.devicegraphiccardmodels_id || item.deviceprocessors_id ||
+                             item.devicemotherboards_id || item.devicememories_id || item.devicenetworkcards_id ||
+                             item.deviceharddrives_id || item.deviceid || item.id;
+
+            if (deviceId) {
+              const deviceUrl = `${apiUrl}/${deviceType}/${deviceId}`;
+              const deviceVisitCount = fetchedUrls.get(deviceUrl) || 0;
+
+              if (deviceVisitCount < MAX_REVISITS) {
+                fetchedUrls.set(deviceUrl, deviceVisitCount + 1);
+                try {
+                  const deviceResponse = await helpers.request({
+                    method: 'GET' as IHttpRequestMethods,
+                    url: deviceUrl,
+                    headers: { 'app-token': appToken, 'session-token': sessionToken },
+                    json: true,
+                  });
+
+                  if (deviceResponse?.links && Array.isArray(deviceResponse.links) && depth < maxDepth) {
+                    const deviceLinks = deviceResponse.links.filter((l: any): l is { rel: string; href: string } =>
+                      typeof l?.rel === 'string' && typeof l?.href === 'string');
+
+                    if (deviceLinks.length > 0) {
+                      const deviceLinkedData = await fetchLinkedData(
+                        deviceLinks,
+                        sessionToken,
+                        apiUrl,
+                        appToken,
+                        helpers,
+                        depth + 1,
+                        maxDepth,
+                        fetchedUrls
+                      );
+                      resultData[deviceType] = { ...deviceResponse, ...deviceLinkedData };
+                      resultData[deviceType.toLowerCase()] = { ...deviceResponse, ...deviceLinkedData };
+                    } else {
+                      resultData[deviceType] = deviceResponse;
+                      resultData[deviceType.toLowerCase()] = deviceResponse;
+                    }
+                  } else {
+                    resultData[deviceType] = deviceResponse;
+                    resultData[deviceType.toLowerCase()] = deviceResponse;
+                  }
+                } catch (error) {
+                  console.error(`Error fetching device data for ${deviceUrl}:`, error);
+                }
+              }
+            }
+          }
+        }
+      }
+
+      linkData[link.rel] = resultData;
+    } catch (error) {
+      console.error(`Error fetching data for ${modifiedUrl}:`, error);
+    }
+  }
+
+  return linkData;
+}
+
+function findEntityReferences(obj: any): Array<{ type: string, id: number | string }> {
+  const references: Array<{ type: string, id: number | string }> = [];
+  if (!obj || typeof obj !== 'object') return references;
+
+  const patterns = [
+    { idField: 'manufacturers_id', typeValue: 'Manufacturer' },
+    { idField: 'computermodels_id', typeValue: 'ComputerModel' },
+    { idField: 'computertypes_id', typeValue: 'ComputerType' },
+    { idField: 'entities_id', typeValue: 'Entity' },
+    { idField: 'states_id', typeValue: 'State' },
+    { idField: 'locations_id', typeValue: 'Location' },
+    { idField: 'users_id', typeValue: 'User' },
+    { idField: 'users_id_tech', typeValue: 'User' },
+    { idField: 'groups_id', typeValue: 'Group' },
+    { idField: 'groups_id_tech', typeValue: 'Group' },
+    { idField: 'devicegraphiccards_id', typeValue: 'DeviceGraphicCard' },
+    { idField: 'devicegraphiccardmodels_id', typeValue: 'DeviceGraphicCardModel' },
+    { idField: 'deviceprocessors_id', typeValue: 'DeviceProcessor' },
+    { idField: 'devicemotherboards_id', typeValue: 'DeviceMotherboard' },
+    { idField: 'devicememories_id', typeValue: 'DeviceMemory' },
+    { idField: 'devicenetworkcards_id', typeValue: 'DeviceNetworkCard' },
+    { idField: 'devicedrives_id', typeValue: 'DeviceDrive' },
+    { idField: 'deviceharddrives_id', typeValue: 'DeviceHardDrive' },
+    { idField: 'devicefirmwares_id', typeValue: 'DeviceFirmware' },
+    { idField: 'devicepowersupplies_id', typeValue: 'DevicePowerSupply' },
+    { idField: 'devicecameras_id', typeValue: 'DeviceCamera' },
+    { idField: 'items_id', typeField: 'itemtype' }
+  ];
+
+  for (const pattern of patterns) {
+    if (obj[pattern.idField] && (obj[pattern.idField] !== 0)) {
+      if (pattern.typeField && obj[pattern.typeField]) {
+        references.push({ type: obj[pattern.typeField], id: obj[pattern.idField] });
+      } else if (pattern.typeValue) {
+        references.push({ type: pattern.typeValue, id: obj[pattern.idField] });
+      }
+    }
+  }
+
+  for (const key in obj) {
+    if (key.endsWith('manufacturers_id')) {
+      const id = obj[key];
+      if (id && id !== 0) references.push({ type: 'Manufacturer', id: id });
+    }
+  }
+
+  return references;
+}
+
+async function getManufacturerData(
+  manufacturerId: number | string,
+  sessionToken: string,
+  apiUrl: string,
+  appToken: string,
+  helpers: IExecuteFunctions['helpers'],
+  fetchedUrls: Map<string, number>
+): Promise<IDataObject> {
+  if (!manufacturerId || manufacturerId === 0) return {};
+
+  const manufacturerUrl = `${apiUrl}/Manufacturer/${manufacturerId}`;
+  const visitCount = fetchedUrls.get(manufacturerUrl) || 0;
+  fetchedUrls.set(manufacturerUrl, visitCount + 1);
+
+  try {
+    const manufacturerResponse = await helpers.request({
+      method: 'GET' as IHttpRequestMethods,
+      url: manufacturerUrl,
+      headers: { 'app-token': appToken, 'session-token': sessionToken },
+      json: true,
+    });
+    return manufacturerResponse || {};
+  } catch (error) {
+    console.error(`Error fetching manufacturer data for ${manufacturerUrl}:`, error);
+    return {};
+  }
+}
+
+export class Glpi implements INodeType {
+  description: INodeTypeDescription = {
+    displayName: 'GLPI',
+    name: 'glpi',
+    icon: 'file:glpi.svg',
+    group: ['input'],
+    version: 1,
+    subtitle: '= GET {{$parameter["resource"]}}',
+    description: 'Interact with GLPI API',
+    defaults: { name: 'GLPI' },
+    inputs: ['main'],
+    outputs: ['main'],
+    credentials: [{ name: 'glpiApi', required: true }],
+    properties: [
+      {
+        displayName: 'Resource',
+        name: 'resource',
+        type: 'hidden',
+        default: 'Computer',
+        description: 'GLPI resource type to query',
+      },
+      {
+        displayName: 'Fields to Keep',
+        name: 'filterFields',
+        type: 'fixedCollection',
+        placeholder: 'Add fields to keep',
+        description: 'Only these fields will be returned in the output',
+        typeOptions: { multipleValues: true, sortable: true },
+        default: {},
+        options: [{
+          displayName: 'Fields',
+          name: 'fields',
+          values: [{ displayName: 'Field Name', name: 'field', type: 'string', default: '' }],
+        }],
+      },
+      {
+        displayName: 'Additional Fields',
+        name: 'additionalFields',
+        type: 'collection',
+        placeholder: 'Add Parameter',
+        default: {},
+        options: [
+          {
+            displayName: 'ID',
+            name: 'id',
+            type: 'number',
+            default: 1,
+            description: 'ID of the resource. If not provided, lists resources.',
+          },
+          {
+            displayName: 'Filters',
+            name: 'filters',
+            type: 'fixedCollection',
+            placeholder: 'Add Filter',
+            typeOptions: { multipleValues: true },
+            default: {},
+            description: 'Filters to apply',
+            options: [{
+              name: 'filters',
+              displayName: 'Filter',
+              values: [
+                {
+                  displayName: 'Field Name',
+                  name: 'filterField',
+                  type: 'string',
+                  default: '',
+                  description: 'Name of the field to filter after API response',
+                },
+                {
+                  displayName: 'Value',
+                  name: 'filterValue',
+                  type: 'string',
+                  default: '',
+                  description: 'Value to filter for',
+                },
+              ],
+            }],
+          },
+        ],
+      },
+      {
+        displayName: 'Return All',
+        name: 'returnAll',
+        type: 'boolean',
+        default: false,
+        description: 'Whether to return all results or only up to a given limit',
+      },
+      {
+        displayName: 'Limit',
+        name: 'limit',
+        type: 'number',
+        typeOptions: { minValue: 1 },
+        default: 50,
+        displayOptions: { show: { returnAll: [false] } },
+        description: 'Max number of results to return',
+      },
+    ],
+  };
+
+  async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
+    const credentials = await this.getCredentials('glpiApi') as {
+      baseUrl: string;
+      appToken: string;
+      userToken: string;
+    };
+
+    const { baseUrl: rawBaseUrl, appToken, userToken } = credentials;
+    const resource = this.getNodeParameter('resource', 0) as string;
+    const returnAll = this.getNodeParameter('returnAll', 0) as boolean;
+    let limit = 0;
+    if (!returnAll) limit = this.getNodeParameter('limit', 0) as number;
+
+    const baseUrl = rawBaseUrl.replace(/\/$/, '');
+    const apiUrl = baseUrl.endsWith('apirest.php') ? baseUrl : `${baseUrl}/apirest.php`;
+
+    const authOptions: IDataObject = {
+      method: 'GET' as IHttpRequestMethods,
+      url: `${apiUrl}/initSession`,
+      headers: { 'App-Token': appToken, 'Authorization': `user_token ${userToken}` },
+      json: true,
+    };
+
+    const authResponse = await this.helpers.request(authOptions);
+    if (!authResponse?.session_token) {
+      throw new NodeApiError(this.getNode(), authResponse, {
+        message: 'GLPI initSession failed, no session token returned',
+      });
+    }
+
+    const sessionToken = authResponse.session_token;
+    const step = 50;
+    let start = 0;
+    const results: IDataObject[] = [];
+
+    const filterFieldsParam = this.getNodeParameter('filterFields', 0, {}) as {
+      fields?: Array<{ field: string }>;
+    };
+    const fieldsToKeep = (filterFieldsParam.fields || []).map(f => f.field).filter(f => !!f);
+
+    const additionalFields = this.getNodeParameter('additionalFields', 0, {}) as IDataObject;
+    const id = additionalFields.id as number | undefined;
+
+    let filters: Array<{ filterField: string; filterValue: string }> = [];
+    if (additionalFields.filters && Array.isArray((additionalFields.filters as any).filters)) {
+      filters = ((additionalFields.filters as any).filters as Array<any>)
+        .map((f) => ({ filterField: f.filterField, filterValue: f.filterValue }))
+        .filter((f) => f.filterField && f.filterValue);
+    }
+
+    const processDetailData = async (detailData: IDataObject): Promise<IDataObject> => {
+      let linkedData: IDataObject = {};
+      const fetchedUrls = new Map<string, number>();
+
+      if (detailData.links && Array.isArray(detailData.links)) {
+        linkedData = await fetchLinkedData(
+          (Array.isArray(detailData.links)
+            ? detailData.links.filter((link): link is { rel: string; href: string } =>
+                typeof link?.rel === 'string' && typeof link?.href === 'string')
+            : []),
+          sessionToken,
+          apiUrl,
+          appToken,
+          this.helpers,
+          1,
+          5,
+          fetchedUrls
+        );
+      }
+
+      const safeGet = (obj: IDataObject, prop: string): string => {
+        if (obj && typeof obj === 'object' && prop in obj) {
+          const value = obj[prop];
+          if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+            return String(value);
+          }
+        }
+        return '';
+      };
+
+      const safeGetNested = (obj: IDataObject, prop: string, nestedProp: string): string => {
+        const nestedObj = obj[prop];
+        if (nestedObj && typeof nestedObj === 'object') return safeGet(nestedObj as IDataObject, nestedProp);
+        return '';
+      };
+
+      const isApple = (obj: IDataObject): boolean => {
+        const manufacturerName = safeGet(obj, 'name');
+        return typeof manufacturerName === 'string' && manufacturerName.toLowerCase().includes('apple');
+      };
+
+      const typeData: IDataObject = (linkedData.ComputerType || linkedData.computertype || {}) as IDataObject;
+      const familyData: IDataObject = (linkedData.ComputerModelFamily || linkedData.computermodelfamily || {}) as IDataObject;
+      const stateData: IDataObject = (linkedData.State || linkedData.state || {}) as IDataObject;
+
+      const graphicsCardLinkData: IDataObject = (linkedData.Item_DeviceGraphicCard || linkedData.item_devicegraphiccard || {}) as IDataObject;
+      const graphicsCardData: IDataObject = (graphicsCardLinkData.DeviceGraphicCard || linkedData.DeviceGraphicCard || {}) as IDataObject;
+
+      const opticalDriveLinkData: IDataObject = (linkedData.Item_DeviceDrive || linkedData.item_devicedrive || {}) as IDataObject;
+			const opticalDriveData: IDataObject = (opticalDriveLinkData.DeviceDrive || linkedData.devicedrive || {}) as IDataObject;
+
+			const webcamLinkData: IDataObject = (linkedData.Item_DeviceCamera || linkedData.item_devicecamera || {}) as IDataObject;
+			const webcamData: IDataObject = (webcamLinkData.DeviceCamera || linkedData.devicecamera || {}) as IDataObject;
+
+			const PCILinkData: IDataObject = (linkedData.Item_DevicePci || linkedData.item_devicepci || {}) as IDataObject;
+			const PCIData: IDataObject = (PCILinkData.DevicePci || linkedData.devicepci || {}) as IDataObject;
+			const hasSerial = String(safeGet(PCIData, 'designation') || '');
+
+			const usbData: number = Array.isArray(detailData.item_deviceusb) ? detailData.item_deviceusb.length : 0
+
+      // const usbLinkData: IDataObject = (linkedData.UsbDevice || linkedData.usbdevice || {}) as IDataObject;
+      const bluetoothData: IDataObject = (linkedData.BluetoothDevice || linkedData.bluetoothdevice || {}) as IDataObject;
+      const keyboardData: IDataObject = (linkedData.Keyboard || linkedData.keyboard || {}) as IDataObject;
+      const memoryData: IDataObject = (linkedData.DeviceMemory || linkedData.devicememory || {}) as IDataObject;
+      const monitorData: IDataObject | IDataObject[] = (linkedData.Monitor || linkedData.monitor || {}) as IDataObject | IDataObject[];
+      const networkPorts = (linkedData.NetworkPort || linkedData.networkport || []) as IDataObject[];
+      const hasWifi: string[] = Array.isArray(networkPorts) ? networkPorts.map(port => safeGet(port, 'type') || '') : [];
+
+      let graphicsCardManufacturerData: IDataObject = {};
+      const graphicsCardManufacturerId = graphicsCardData.manufacturers_id;
+      if (graphicsCardManufacturerId) {
+        graphicsCardManufacturerData = await getManufacturerData(
+          String(graphicsCardManufacturerId),
+          sessionToken,
+          apiUrl,
+          appToken,
+          this.helpers,
+          fetchedUrls
+        );
+      }
+
+      let manufacturerData: IDataObject = (linkedData.Manufacturer || linkedData.manufacturer || {}) as IDataObject;
+      const computerId = detailData.manufacturers_id;
+      if (computerId && (!manufacturerData || Object.keys(manufacturerData).length === 0)) {
+        manufacturerData = await getManufacturerData(
+          String(computerId),
+          sessionToken,
+          apiUrl,
+          appToken,
+          this.helpers,
+          fetchedUrls
+        );
+      }
+
+      const processorLinkData: IDataObject = (linkedData.Item_DeviceProcessor || linkedData.item_deviceprocessor || {}) as IDataObject;
+      const processorData: IDataObject = (processorLinkData.DeviceProcessor || linkedData.DeviceProcessor || {}) as IDataObject;
+      let processorManufacturerData: IDataObject = {};
+      const processorManufacturerId = processorData.manufacturers_id;
+      if (processorManufacturerId) {
+        processorManufacturerData = await getManufacturerData(
+          String(processorManufacturerId),
+          sessionToken,
+          apiUrl,
+          appToken,
+          this.helpers,
+          fetchedUrls
+        );
+      }
+			const frequencyValue = Number(safeGet(processorData, 'frequence'));
+			const unit = isNaN(frequencyValue) ? 'MHz' : (frequencyValue > 1000 ? 'MHz' : 'GHz');
+
+      let processedData: IDataObject = {
+        "ID": detailData.id || '', //Done
+        "Nom": detailData.name || '', //Done
+        "Numéro de série": detailData.serial || '', //Done
+        "Modèle": detailData.computermodels_id || '', //Done
+        "Type de produit": detailData.computertypes_id || '', //Done
+        "facteur de forme": safeGet(familyData, 'name') || 'Famille non trouvée',
+        "Statut": detailData.states_id || '', //Done
+        "Plateforme matérielle": (isApple(manufacturerData) || isApple((detailData.manufacturers as IDataObject) || {})) ? 'Mac' : 'PC', //Done
+        "Carte Graphique": safeGet(graphicsCardData, 'designation') || 'Carte graphique non trouvée', //Done
+        "Marque Carte Graphique": safeGet(graphicsCardManufacturerData, 'name') || 'Marque non trouvée', //Done
+        "Type Processeur": safeGet(processorData, 'designation') || safeGetNested(detailData, 'item_deviceprocessors', 'name') || 'Type non spécifié', //Done
+        "Marque Processeur": safeGet(processorManufacturerData, 'name') || 'Marque non trouvée', //Done
+        "Version Processeur": safeGet(processorData, 'version') || safeGet(detailData, 'processor_version') || 'Version non spécifiée', //??
+        "Vitesse Processeur": safeGet(processorData, 'frequence') || safeGet(detailData, 'processor_frequence') || 'Vitesse non spécifiée', //Done
+        "Unité de mesure processeur": unit,
+        "Nombre de processeur": safeGet(processorData, 'nbcores_default') || safeGet(detailData, 'nbcores') || '1', //Done
+        "lecteur optique": safeGet(opticalDriveData, 'designation') || 'Pas de lecteur optique', //Done
+				"webcam":safeGet(webcamData, 'designation') || 'Pas de webcam', //Done
+        "port série (fiche test)": hasSerial.includes('Serial') ? 'Oui' : 'Non', //Done
+        "nombre de port usb (fiche test)": usbData, //??
+        "bluetooth (fiche test)": safeGet(bluetoothData, 'name') || (detailData.has_bluetooth === true ? 'Oui' : 'Non'), //??
+        "wifi (fiche de test)": hasWifi.includes('NetworkPortWifi') ? 'Oui' : 'Non', //??
+        "clavier (fiche test)": safeGet(keyboardData, 'name') || (detailData.has_keyboard === true ? 'Oui' : 'Non'), //??
+        "type de ram": safeGet(memoryData, 'type') || safeGet(detailData, 'memory_type') || 'Type non spécifié', //??
+      };
+
+      const monitors = Array.isArray(monitorData) ? monitorData : [monitorData];
+      if (monitors && monitors.length > 0) {
+        const monitor = monitors[0] as IDataObject;
+        processedData = {
+          ...processedData,
+          "taille de l'écran (fiche test)": safeGet(monitor, 'size') || safeGet(detailData, 'screen_size') || 'Taille non trouvée', //??
+          "unité de mesure pour la taille de l'écran (auto)": safeGet(monitor, 'size_unit') || safeGet(detailData, 'screen_size_unit') || 'pouces', //??
+          "webcam (fiche test)": safeGet(monitor, 'has_webcam') || safeGet(detailData, 'has_webcam') || 'Non spécifié', //??
+          "résolution maximale (fiche test)": safeGet(monitor, 'resolution') || safeGet(detailData, 'screen_resolution') || 'Résolution non spécifiée', //??
+        };
+      } else {
+        processedData = {
+          ...processedData,
+          "taille de l'écran (fiche test)": safeGet(detailData, 'screen_size') || 'Taille non trouvée', //??
+          "unité de mesure pour la taille de l'écran (auto)": safeGet(detailData, 'screen_size_unit') || 'pouces', //??
+          "webcam (fiche test)": safeGet(detailData, 'has_webcam') || 'Non spécifié', //??
+          "résolution maximale (fiche test)": safeGet(detailData, 'screen_resolution') || 'Résolution non spécifiée', //??
+        };
+      }
+
+      const processorStr = String(detailData.processor || safeGet(processorData, 'designation') || '');
+      const hasSerialPort = Boolean(detailData.has_serialport);
+      processedData["OS"] = processorStr.includes('8th Gen') ? 'Windows 11' :
+        (processorStr.toLowerCase().includes('i3 1st gen') || hasSerialPort) ? 'Windows XP' :
+        (processorStr.includes('Intel')) ? 'Windows 7/10' :
+				(hasSerial.includes('Serial') ? 'Windows XP' : 'Linux'); //Done
+
+      processedData = filterFields(cleanEmptyObjects(processedData) || {}, fieldsToKeep);
+      return processedData;
+    };
+
+    try {
+      if (id !== undefined && id !== null) {
+        const detailOptions: IDataObject = {
+          method: 'GET' as IHttpRequestMethods,
+          url: `${apiUrl}/${resource}/${id}?expand_dropdowns=true`,
+          headers: { 'app-token': appToken, 'session-token': sessionToken },
+          json: true,
+        };
+        const detailData = await this.helpers.request(detailOptions);
+        if (!detailData) throw new NodeApiError(this.getNode(), detailData, { message: `No data found for ID ${id}` });
+        const processed = await processDetailData(detailData);
+        results.push(processed);
+      } else {
+        do {
+          const qs: IDataObject = { range: `${start}-${start + step - 1}` };
+          const listOptions: IDataObject = {
+            method: 'GET' as IHttpRequestMethods,
+            url: `${apiUrl}/${resource}`,
+            headers: { 'app-token': appToken, 'session-token': sessionToken },
+            qs,
+            json: true,
+          };
+
+          const response = await this.helpers.request(listOptions);
+          if (!Array.isArray(response)) break;
+
+          const detailPromises = response.map(async (item) => {
+            const itemId = item.id;
+            if (!itemId) return null;
+            const detailOptions: IDataObject = {
+              method: 'GET' as IHttpRequestMethods,
+              url: `${apiUrl}/${resource}/${itemId}?expand_dropdowns=true`,
+              headers: { 'app-token': appToken, 'session-token': sessionToken },
+              json: true,
+            };
+
+            try {
+              const detailData = await this.helpers.request(detailOptions);
+              if (!detailData) return null;
+              return await processDetailData(detailData);
+            } catch (error) {
+              console.error(`Error processing item ${itemId}:`, error);
+              return null;
+            }
+          });
+
+          const details = await Promise.all(detailPromises);
+          results.push(
+            ...details.filter(
+              (item): item is IDataObject =>
+                typeof item === 'object' && item !== null && !Array.isArray(item)
+            )
+          );
+
+          start += step;
+        } while (returnAll && results.length < limit);
+
+        if (filters.length > 0) {
+          const filtersByField: { [key: string]: string[] } = {};
+          filters.forEach(f => {
+            if (!filtersByField[f.filterField]) filtersByField[f.filterField] = [];
+            filtersByField[f.filterField].push(f.filterValue);
+          });
+
+          results.splice(
+            0,
+            results.length,
+            ...results.filter((item) =>
+              Object.entries(filtersByField).every(([field, values]) => {
+                const itemValue = String(item[field] ?? '');
+                return values.some(value => itemValue === String(value));
+              })
+            )
+          );
+        }
+
+        if (!returnAll && limit > 0 && results.length > limit) results.length = limit;
+      }
+    } finally {
+      try {
+        await this.helpers.request({
+          method: 'GET' as IHttpRequestMethods,
+          url: `${apiUrl}/killSession`,
+          headers: { 'app-token': appToken, 'session-token': sessionToken },
+          json: true,
+        });
+      } catch (error) {
+        console.error('Error killing session:', error);
+      }
+    }
+
+    return [results.map(result => ({ json: result }))];
+  }
+}

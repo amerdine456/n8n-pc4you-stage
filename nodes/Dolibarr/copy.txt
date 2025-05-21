@@ -1,0 +1,396 @@
+import {
+	IExecuteFunctions,
+	INodeExecutionData,
+	INodeType,
+	INodeTypeDescription,
+	NodeOperationError,
+	IHttpRequestMethods,
+	IDataObject,
+} from 'n8n-workflow';
+
+import  {
+	cleanEmptyObjects,
+	filterFields,
+	IAdditionalFields,
+	IFilter,
+	IFilterField,
+	IProductData,
+	IThirdpartyData
+} from './DolibarrHelper';
+
+export class Dolibarr implements INodeType {
+	description: INodeTypeDescription = {
+			displayName: 'Dolibarr',
+			name: 'dolibarr',
+			icon: 'file:dolibarr.svg',
+			group: ['input'],
+			version: 1,
+			subtitle: '={{$parameter["operation"].toUpperCase()}} = {{$parameter["resource"]}}',
+			description: 'Interact with Dolibarr API',
+			defaults: {
+					name: 'Dolibarr',
+			},
+			inputs: ['main'],
+			outputs: ['main'],
+			credentials: [
+					{
+							name: 'dolibarrApi',
+							required: true,
+					},
+			],
+			properties: [
+					{
+							displayName: 'Resource',
+							name: 'resource',
+							type: 'options',
+							noDataExpression: true,
+							options: [
+									{ name: 'Bank', value: 'bankaccounts' },
+									{ name: 'Contact', value: 'contacts' },
+									{ name: 'Expense', value: 'expensereports' },
+									{ name: 'Facture', value: 'invoices' },
+									{ name: 'Order', value: 'orders' },
+									{ name: 'Payment', value: 'payments' },
+									{ name: 'Produit', value: 'products' },
+									{ name: 'Project', value: 'projects' },
+									{ name: 'Proposal', value: 'proposals' },
+									{ name: 'Société', value: 'thirdparties' },
+									{ name: 'Utilisateur', value: 'users' },
+									{ name: 'Warehouse', value: 'warehouses' },
+							],
+							default: 'users',
+					},
+					{
+							displayName: 'Operation',
+							name: 'operation',
+							type: 'options',
+							noDataExpression: true,
+							options: [
+									{ name: 'Get', value: 'get' },
+									{ name: 'Create', value: 'create' },
+									{ name: 'Update', value: 'update' },
+									{ name: 'Delete', value: 'delete' },
+							],
+							default: 'get',
+					},
+					{
+							displayName: 'ID',
+							name: 'id',
+							type: 'number',
+							default: 1,
+							required: true,
+							description: 'ID of the resource to update or delete',
+							displayOptions: {
+									show: {
+											operation: ['update', 'delete'],
+									},
+							},
+					},
+					{
+							displayName: 'Fields to Keep',
+							name: 'filterFields',
+							type: 'fixedCollection',
+							placeholder: 'Add fields to keep',
+							description: 'Only these fields will be returned in the output',
+							typeOptions: {
+									multipleValues: true,
+									sortable: true,
+							},
+							default: {},
+							displayOptions: {
+									show: {
+											operation: ['get'],
+									},
+							},
+							options: [
+									{
+											displayName: 'Fields',
+											name: 'fields',
+											values: [
+													{
+															displayName: 'Field Name',
+															name: 'field',
+															type: 'string',
+															default: '',
+													},
+											],
+									},
+							],
+					},
+					{
+							displayName: 'Additional Fields',
+							name: 'additionalFields',
+							type: 'collection',
+							placeholder: 'Add Parameter',
+							default: {},
+							displayOptions: {
+									show: {
+											operation: ['get'],
+									},
+							},
+							options: [
+									{
+											displayName: 'ID',
+											name: 'id',
+											type: 'number',
+											default: 1,
+											description: 'ID of the resource. If not provided, lists resources.',
+									},
+									{
+											displayName: 'Limit',
+											name: 'limit',
+											type: 'number',
+											default: 50,
+											typeOptions: { minValue: 1 },
+											description: 'Max number of results to return',
+									},
+									{
+											displayName: 'Filters',
+											name: 'filters',
+											type: 'fixedCollection',
+											placeholder: 'Add Filter',
+											typeOptions: {
+													multipleValues: true,
+											},
+											default: {},
+											description: 'Filters to apply',
+											options: [
+													{
+															name: 'filters',
+															displayName: 'Filter',
+															values: [
+																	{
+																			displayName: 'Field Name',
+																			name: 'filterField',
+																			type: 'string',
+																			default: '',
+																			description: 'Name of the field to filter after API response',
+																	},
+																	{
+																			displayName: 'Value',
+																			name: 'filterValue',
+																			type: 'string',
+																			default: '',
+																			description: 'Value to filter for',
+																	},
+															],
+													},
+											],
+									},
+									{
+											displayName: "Sort",
+											name: "sortRule",
+											type: "collection",
+											default: {
+													field: "id",
+													direction: "asc"
+											},
+											description: "Field to sort by and its direction",
+											options: [
+													{
+															displayName: "Field Name",
+															name: "field",
+															type: "string",
+															default: "id",
+															description: "Field name to sort by"
+													},
+													{
+															displayName: "Order",
+															name: "direction",
+															type: "options",
+															default: "asc",
+															options: [
+																	{ name: "Ascending", value: "asc" },
+																	{ name: "Descending", value: "desc" }
+															]
+													}
+											]
+									},
+							],
+					},
+					{
+							displayName: 'Thirdparty Data',
+							name: 'thirdpartyData',
+							type: 'collection',
+							placeholder: 'Add Field',
+							default: {},
+							displayOptions: {
+									show: {
+											resource: ['thirdparties'],
+											operation: ['create', 'update'],
+									},
+							},
+							options: [
+									{ name: 'Name', value: 'name', type: 'string', default: '' },
+									{ name: 'Address', value: 'address', type: 'string', default: '' },
+							],
+					},
+					{
+							displayName: 'Product Data',
+							name: 'productData',
+							type: 'collection',
+							placeholder: 'Add Field',
+							default: {},
+							displayOptions: {
+									show: {
+											resource: ['products'],
+											operation: ['create', 'update'],
+									},
+							},
+							options: [
+									{ name: 'Label', value: 'label', type: 'string', default: '' },
+									{ name: 'Ref', value: 'ref', type: 'string', default: '' },
+									{ name: 'Price', value: 'price', type: 'number', default: 0 },
+							],
+					},
+			],
+	};
+
+	async execute(this: IExecuteFunctions): Promise<INodeExecutionData[][]> {
+			const items = this.getInputData();
+			const resource = this.getNodeParameter('resource', 0) as string;
+			const operation = this.getNodeParameter('operation', 0) as string;
+			const credentials = await this.getCredentials('dolibarrApi');
+			const baseUrl = (credentials.baseUrl as string).replace(/\/+$/, '');
+			const apiKey = credentials.apiKey as string;
+
+			const returnData: INodeExecutionData[] = [];
+
+			for (let i = 0; i < items.length; i++) {
+					try {
+							let url = `${baseUrl}/api/index.php/${resource}`;
+							let method: IHttpRequestMethods = 'GET';
+							let body: any = undefined;
+
+							const headers = {
+									'DOLAPIKEY': apiKey,
+							};
+
+							const filterCollection = this.getNodeParameter('filterFields', i, {}) as {
+									fields?: IFilterField[];
+							};
+							const fieldsToKeep = (filterCollection.fields || []).map(f => f.field).filter(f => !!f);
+
+							const additionalFields = this.getNodeParameter('additionalFields', i, {}) as IAdditionalFields;
+
+							if (operation === 'get') {
+									const { id, limit } = additionalFields;
+									if (id) {
+											url += `/${id}`;
+									} else {
+											const queryParams: string[] = [];
+											if (limit) queryParams.push(`limit=${limit}`);
+											if (queryParams.length) url += `?${queryParams.join('&')}`;
+									}
+							}
+
+							if (['delete', 'update'].includes(operation)) {
+									const id = this.getNodeParameter('id', i) as number;
+									url += `/${id}`;
+							}
+
+							if (['create', 'update'].includes(operation)) {
+									switch (resource) {
+											case 'thirdparties':
+													body = this.getNodeParameter('thirdpartyData', i) as IThirdpartyData;
+													break;
+											case 'products':
+													body = this.getNodeParameter('productData', i) as IProductData;
+													break;
+											default:
+													throw new NodeOperationError(this.getNode(), `Resource '${resource}' does not support create or update operations.`, { itemIndex: i });
+									}
+							}
+
+							switch (operation) {
+									case 'get':
+											method = 'GET';
+											break;
+									case 'delete':
+											method = 'DELETE';
+											break;
+									case 'create':
+											method = 'POST';
+											break;
+									case 'update':
+											method = 'PUT';
+											break;
+									default:
+											throw new NodeOperationError(this.getNode(), `Unsupported operation: ${operation}`, { itemIndex: i });
+							}
+
+							let response = await this.helpers.request({
+									method,
+									url,
+									headers,
+									body,
+									json: true,
+							});
+
+							const filters = additionalFields.filters as IDataObject | undefined;
+
+							if (
+									filters?.filters &&
+									Array.isArray(filters.filters) &&
+									Array.isArray(response)
+							) {
+									for (const filter of filters.filters as IFilter[]) {
+											const field = filter.filterField;
+											const value = filter.filterValue;
+
+											if (!field || value === undefined) continue;
+
+											response = response.filter((item: any) => {
+													const itemValue = item?.[field];
+													return itemValue !== undefined && String(itemValue).toLowerCase() === String(value).toLowerCase();
+											});
+									}
+							}
+
+							const sortRule = additionalFields.sortRule;
+
+							if (sortRule?.field && Array.isArray(response)) {
+									const { field, direction } = sortRule;
+
+									response.sort((a: any, b: any) => {
+											const aVal = a?.[field];
+											const bVal = b?.[field];
+
+											if (aVal === undefined && bVal === undefined) return 0;
+											if (aVal === undefined) return 1;
+											if (bVal === undefined) return -1;
+
+											if (typeof aVal === 'number' && typeof bVal === 'number') {
+													return direction === 'desc' ? bVal - aVal : aVal - bVal;
+											}
+
+											const aStr = String(aVal).toLowerCase();
+											const bStr = String(bVal).toLowerCase();
+
+											if (aStr < bStr) return direction === 'desc' ? 1 : -1;
+											if (aStr > bStr) return direction === 'desc' ? -1 : 1;
+											return 0;
+									});
+							}
+
+							if (Array.isArray(response)) {
+									for (const item of response) {
+											const cleanedItem = cleanEmptyObjects(item);
+											returnData.push({ json: filterFields(cleanedItem, fieldsToKeep) });
+									}
+							} else {
+									const cleanedResponse = cleanEmptyObjects(response);
+									returnData.push({ json: filterFields(cleanedResponse, fieldsToKeep) });
+							}
+					} catch (error) {
+							if (this.continueOnFail()) {
+									returnData.push({ json: { error: (error as Error).message } });
+							} else {
+									throw new NodeOperationError(this.getNode(), error, { itemIndex: i });
+							}
+					}
+			}
+
+			return [returnData];
+	}
+}
