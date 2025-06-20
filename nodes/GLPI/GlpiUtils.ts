@@ -62,47 +62,51 @@ export function formatMemoryModules(memoryItems: IDataObject[]): string {
   return `Total: ${totalSizeInGB}\n${modules.join('\n')}`;
 }
 
+/**
+ * Recupère les données liées aux ordinateurs.
+ */
 export async function fetchLinkedData(
   computerData: IDataObject,
   sessionToken: string,
   apiUrl: string,
   appToken: string,
   helpers: IExecuteFunctions['helpers'],
-  requestDelay: number = 100,
-  maxConcurrency: number = 5,
+  requestDelay: number = 100, // Délai entre les requêtes
+  maxConcurrency: number = 5, // Limite de requêtes simultanées
   cache: { [key: string]: { data: any; timestamp: number; promise?: Promise<any> } }
 ): Promise<IDataObject> {
   const allData: IDataObject = {};
   const processedIds = new Set<string>();
   const CACHE_TTL = 300000; // 5 minutes in milliseconds
-  let activeRequests = 0;
+  let activeRequests = 0; // Compteur de requêtes actives
 
+  // Fonction pour récupérer les données avec mise en cache
   const fetchDataWithCache = async (url: string, entityType: string): Promise<IDataObject> => {
     if (!url) return {};
 
     const now = Date.now();
 
-    // Check if we have a valid cached response
+    // Vérification si nous avons une réponse mise en cache valide
     if (cache[url] && now - cache[url].timestamp < CACHE_TTL) {
       return cache[url].data;
     }
 
-    // If this URL is already being fetched, return the existing promise
+    // Si cette URL est déjà en cours de récupération, retourner la promesse existante
     if (cache[url] && cache[url].promise) {
       return cache[url].promise;
     }
 
-    // Queue management - wait until we have capacity
+    // Gestion de la file d'attente - attendre jusqu'à ce que nous ayons de la capacité
     while (activeRequests >= maxConcurrency) {
       await new Promise(resolve => setTimeout(resolve, 50));
     }
 
     activeRequests++;
 
-    // Create a promise for this request and store it in the cache
+    // Créer une promesse pour cette requête et la stocker dans le cache
     const requestPromise = (async () => {
       try {
-        // Add tiny randomized delay to prevent exact simultaneous requests
+        // Ajouter un petit délai aléatoire pour éviter les requêtes simultanées exactes
         await new Promise(resolve => setTimeout(resolve, Math.random() * 50));
 
         const response = await helpers.request({
@@ -114,7 +118,7 @@ export async function fetchLinkedData(
           if (error.toString().includes('socket hang up') ||
              error.toString().includes('ECONNRESET') ||
              error.toString().includes('timeout')) {
-            // Implement exponential backoff with jitter for retries
+            // Implémenter un backoff exponentiel avec jitter pour les réessais
             const backoffDelay = requestDelay * 3 * (1 + Math.random() * 0.2);
             await new Promise(resolve => setTimeout(resolve, backoffDelay));
             return helpers.request({
@@ -127,7 +131,7 @@ export async function fetchLinkedData(
           throw error;
         });
 
-        // Cache the successful response
+        // Mise en cache de la réponse réussie
         cache[url] = { data: response, timestamp: now };
         return response;
       } catch (error) {
@@ -135,14 +139,14 @@ export async function fetchLinkedData(
         return {};
       } finally {
         activeRequests--;
-        // Clean up the promise reference
+        // Nettoyer la référence de la promesse
         if (cache[url]) {
           delete cache[url].promise;
         }
       }
     })();
 
-    // Store the promise in the cache
+    // Stocker la promesse dans le cache
     if (!cache[url]) {
       cache[url] = { data: {}, timestamp: 0, promise: requestPromise };
     } else {
@@ -152,35 +156,45 @@ export async function fetchLinkedData(
     return requestPromise;
   };
 
-  // Batch fetch helper - more efficient than the original limitConcurrency
+  // Fonction d'aide pour le traitement par lots - plus efficace que la limite de concurrence originale
   const batchFetch = async <T>(
     items: T[],
     processFn: (item: T) => Promise<void>
   ): Promise<void> => {
-    // Process all items in parallel but control concurrency via fetchDataWithCache
+    // Traiter tous les éléments en parallèle mais contrôler la concurrence via fetchDataWithCache
     await Promise.all(items.map(processFn));
   };
 
   const computerId = computerData.id;
   if (!computerId) return allData;
 
-  // Prepare all URLs we'll need to fetch upfront
+  // Préparer toutes les URLs que nous devrons récupérer à l'avance
   const urlsToFetch: { key: string; url: string; entityType: string }[] = [];
 
-  // Relationships (components attached to this computer)
+  /**
+	 * Pour les objets de type "Item_" qui se trouve dans les relations
+	 * Ex: Item_DeviceMotherboard, Item_DeviceFirmware, etc
+	 * */
+	// Relations (composants attachés à cet ordinateur)
   const relationships = [
     { key: 'Item_DeviceGraphicCard', idKey: 'devicegraphiccards_id', dataKey: 'items_id_devicegraphiccards' },
     { key: 'Item_DeviceProcessor', idKey: 'deviceprocessors_id', dataKey: 'items_id_deviceprocessors' },
     { key: 'Item_DeviceMemory', idKey: 'devicememories_id', dataKey: 'items_id_devicememories' },
+
   ];
 
-	// Add Infocom to URLs to fetch directly
+	/**
+	 * Pour les objets hors "Item_" qui se trouve dans les relations
+	 * Ex: Infocom, ReservationItem, etc
+	 */
+	// Ajouter Infocom aux URLs à récupérer directement
   urlsToFetch.push({
     key: 'Infocom',
     url: `${apiUrl}/Computer/${computerId}/Infocom`,
     entityType: 'Infocom'
   });
 
+  // Ajouter les relations à la liste des URLs à récupérer
   relationships.forEach(({ key }) => {
     urlsToFetch.push({
       key,
@@ -189,7 +203,7 @@ export async function fetchLinkedData(
     });
   });
 
-  // First, fetch all relationships in parallel
+  // D'abord, récupérer toutes les relations en parallèle
   await batchFetch(relationships, async ({ key, idKey, dataKey }) => {
     const relUrl = `${apiUrl}/Computer/${computerId}/${key}`;
     const relData = await fetchDataWithCache(relUrl, key);
@@ -201,7 +215,11 @@ export async function fetchLinkedData(
     }
   });
 
-  // Now prepare URLs for all linked entities
+  // Maintenant, préparer les URLs pour toutes les entités liées
+	/**
+	 * Pour les objets de type "Device" qui se trouve dans les relations ou liés directement aux ordinateurs via leurs IDs
+	 * Ex: DeviceMotherboard, DeviceGraphicCard, State, Manufacturer, etc
+	 */
   const templateUrls = [
     { key: 'ComputerModel', id: computerData.computermodels_id, urlPrefix: 'ComputerModel' },
     { key: 'ComputerType', id: computerData.computertypes_id, urlPrefix: 'ComputerType' },
@@ -213,7 +231,7 @@ export async function fetchLinkedData(
     { key: 'DeviceMemory', id: computerData.devicememories_id, urlPrefix: 'DeviceMemory' },
   ].filter(t => t.id && !processedIds.has(t.id.toString()));
 
-  // Add each valid template URL to our fetch queue
+  // Ajouter chaque URL de modèle valide à notre file d'attente de récupération
   templateUrls.forEach(({ key, id, urlPrefix }) => {
     if (id != null) {
       processedIds.add(id.toString());
@@ -225,7 +243,7 @@ export async function fetchLinkedData(
     }
   });
 
-	// Inside fetchLinkedData function, after fetching Item_DeviceGraphicCard
+	// Après la récupération de Item_DeviceGraphicCard si il y'a plusieurs cartes graphiques
 	if (allData.Item_DeviceGraphicCard && Array.isArray(allData.Item_DeviceGraphicCard)) {
 		const graphicsCardItems = allData.Item_DeviceGraphicCard as IDataObject[];
 		const graphicsCardDetailsPromises = graphicsCardItems.map(async (item) => {
@@ -243,7 +261,7 @@ export async function fetchLinkedData(
 		allData.DeviceGraphicCardDetails = graphicsCardDetails.filter(detail => detail !== null);
 	}
 
-  // Inside fetchLinkedData function, after fetching Item_DeviceMemory
+  // Après la récupération de Item_DeviceMemory si il y'a plusieurs mémoires
 	if (allData.Item_DeviceMemory && Array.isArray(allData.Item_DeviceMemory)) {
 		const memoryItems = allData.Item_DeviceMemory as IDataObject[];
 		const memoryDetailsPromises = memoryItems.map(async (item) => {
@@ -261,8 +279,7 @@ export async function fetchLinkedData(
 		allData.DeviceMemoryDetails = memoryDetails.filter(detail => detail !== null);
 	}
 
-
-	// Inside fetchLinkedData function, after fetching Item_DeviceProcessor
+	// Après la récupération de Item_DeviceProcessor si il y'a plusieurs processeurs
 	if (allData.Item_DeviceProcessor && Array.isArray(allData.Item_DeviceProcessor)) {
 		const processorItems = allData.Item_DeviceProcessor as IDataObject[];
 		const processorDetailsPromises = processorItems.map(async (item) => {
@@ -280,33 +297,32 @@ export async function fetchLinkedData(
 		allData.DeviceProcessorDetails = processorDetails.filter(detail => detail !== null);
 	}
 
-
-  // Fetch all prepared URLs in parallel (with concurrency control in fetchDataWithCache)
+  // Récupérer toutes les URLs préparées en parallèle (avec contrôle de concurrence dans fetchDataWithCache)
   await batchFetch(urlsToFetch, async ({ key, url, entityType }) => {
     const data = await fetchDataWithCache(url, entityType);
 
-    // For memory types, store with specific ID in the key
+    // Pour les types de mémoire, stocker avec un ID spécifique dans la clé
     if (key.startsWith('DeviceMemory_')) {
       allData[key] = data;
     } else {
       allData[key] = data;
     }
 
-		// For processor types, store with specific ID in the key
+		// Pour les types de processeur, stocker avec un ID spécifique dans la clé
     if (key.startsWith('DeviceProcessor_')) {
       allData[key] = data;
     } else {
       allData[key] = data;
     }
 
-		// For graphic card types, store with specific ID in the key
+		// Pour les types de carte graphique, stocker avec un ID spécifique dans la clé
     if (key.startsWith('DeviceGraphicCard_')) {
       allData[key] = data;
     } else {
       allData[key] = data;
     }
 
-    // Add processor manufacturer lookup if needed
+    // Ajouter une recherche de fabricant de processeur si nécessaire
     if (key === 'DeviceProcessor' && data.manufacturers_id && !processedIds.has(data.manufacturers_id.toString())) {
       processedIds.add(data.manufacturers_id.toString());
       const manUrl = `${apiUrl}/Manufacturer/${data.manufacturers_id}`;

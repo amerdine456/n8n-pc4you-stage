@@ -6,6 +6,7 @@ import {
   NodeApiError,
   IDataObject,
   IHttpRequestMethods,
+	NodeConnectionType,
 } from 'n8n-workflow';
 
 import { cleanEmptyObjects, filterFields, fetchLinkedData } from './GlpiUtils';
@@ -25,8 +26,10 @@ export class Glpi implements INodeType {
     subtitle: '= GET {{$parameter["resource"]}}',
     description: 'Interact with GLPI API',
     defaults: { name: 'GLPI' },
-    inputs: ['main'],
-    outputs: ['main'],
+    // eslint-disable-next-line n8n-nodes-base/node-class-description-inputs-wrong-regular-node
+		inputs: ['main' as NodeConnectionType],
+		// eslint-disable-next-line n8n-nodes-base/node-class-description-outputs-wrong
+		outputs: ['main' as NodeConnectionType],
     credentials: [{ name: 'glpiApi', required: true }],
     properties: [
       {
@@ -36,6 +39,8 @@ export class Glpi implements INodeType {
         default: 'Computer',
         description: 'GLPI resource type to query',
       },
+
+			// Système de filtrage des champs en sortie
       {
         displayName: 'Fields to Keep',
         name: 'filterFields',
@@ -57,6 +62,7 @@ export class Glpi implements INodeType {
         placeholder: 'Add Parameter',
         default: {},
         options: [
+					// Système de filtrage par ID
           {
             displayName: 'ID',
             name: 'id',
@@ -64,6 +70,7 @@ export class Glpi implements INodeType {
             default: 1,
             description: 'ID of the resource. If not provided, lists resources.',
           },
+					// Système de filtrage par champs
           {
             displayName: 'Filters',
             name: 'filters',
@@ -95,6 +102,7 @@ export class Glpi implements INodeType {
           },
         ],
       },
+			// Système limitant le nombre de résultats
       {
         displayName: 'Return All',
         name: 'returnAll',
@@ -130,6 +138,7 @@ export class Glpi implements INodeType {
     const baseUrl = rawBaseUrl.replace(/\/$/, '');
     const apiUrl = baseUrl.endsWith('apirest.php') ? baseUrl : `${baseUrl}/apirest.php`;
 
+		// Récupération du token de session de GLPI avec le token d'application et le token utilisateur
     const authOptions: IDataObject = {
       method: 'GET' as IHttpRequestMethods,
       url: `${apiUrl}/initSession`,
@@ -163,40 +172,40 @@ export class Glpi implements INodeType {
         .filter((f) => f.filterField && f.filterValue);
     }
 
-    // Enhanced cache with TTL and request deduplication
+		// Utilisation d'un cache pour stocker les réponses de l'API
     const cache: { [key: string]: { data: any; timestamp: number; promise?: Promise<any> } } = {};
-    const CACHE_TTL = 300000; // 5 minutes in milliseconds
+    const CACHE_TTL = 300000; // 5 minutes en millisecondes
 
-    // Enhanced logging with request queue information
+    // Fonction pour enregistrer les requêtes API
     const logApiRequest = (url: string, entityType: string, duration: number, queueLength: number): void => {
       console.log(`[${entityType}] Fetched in ${duration}ms (Queue: ${queueLength}): ${url}`);
     };
 
-    // Request queue management
+    // Fonction pour gérer les requêtes API avec un cache et une gestion de la concurrence
     let activeRequests = 0;
-    const maxConcurrentRequests = Math.min(Math.max(concurrency, 1), 20); // Limit between 1-20
+    const maxConcurrentRequests = Math.min(Math.max(concurrency, 1), 20); // Limite de 20 requêtes simultanées
 
     const fetchDataWithCache = async (url: string, entityType: string): Promise<IDataObject> => {
       const now = Date.now();
 
-      // Check if we have a valid cached response
+      // Vérifier si la réponse est déjà dans le cache et si elle est encore valide
       if (cache[url] && now - cache[url].timestamp < CACHE_TTL) {
         return cache[url].data;
       }
 
-      // If this URL is already being fetched, return the existing promise
+      // Si la réponse est dans le cache mais expirée, on la supprime
       if (cache[url] && cache[url].promise) {
         return cache[url].promise;
       }
 
-      // Queue management - wait until we have capacity
+      // Queue management - attendre que le nombre de requêtes actives soit inférieur à la limite
       while (activeRequests >= maxConcurrentRequests) {
         await new Promise(resolve => setTimeout(resolve, 50));
       }
 
       activeRequests++;
 
-      // Create a promise for this request and store it in the cache
+      // Créer une promesse pour cette requête et la stocker dans le cache
       const requestPromise = (async () => {
         try {
           const startTime = Date.now();
@@ -209,23 +218,23 @@ export class Glpi implements INodeType {
           const duration = Date.now() - startTime;
           logApiRequest(url, entityType, duration, activeRequests);
 
-          // Cache the successful response
+          // Mettre à jour le cache avec la réponse
           cache[url] = { data: response, timestamp: Date.now() };
           return response;
         } catch (error) {
           console.error(`Error fetching ${entityType} at ${url}:`, error);
-          // Don't cache errors
+          // En cas d'erreur, on supprime la promesse du cache
           return {};
         } finally {
           activeRequests--;
-          // Clean up the promise reference
+          // Supprimer la promesse du cache une fois la requête terminée
           if (cache[url]) {
             delete cache[url].promise;
           }
         }
       })();
 
-      // Store the promise in the cache
+      // Stocker la promesse dans le cache pour éviter les requêtes simultanées
       if (!cache[url]) {
         cache[url] = { data: {}, timestamp: 0, promise: requestPromise };
       } else {
@@ -235,7 +244,7 @@ export class Glpi implements INodeType {
       return requestPromise;
     };
 
-    // Prefetch common data that might be used by multiple entities
+    // Fonction pour précharger les données communes
     const prefetchCommonData = async (): Promise<void> => {
       const commonResources = [
         'ComputerModel',
@@ -254,6 +263,7 @@ export class Glpi implements INodeType {
       ));
     };
 
+		// Fonction pour récupérer les données liées
     const safeGet = (obj: IDataObject, prop: string): string => {
       if (obj && typeof obj === 'object' && prop in obj) {
         const value = obj[prop];
@@ -264,6 +274,7 @@ export class Glpi implements INodeType {
       return '';
     };
 
+		// Fonction pour traiter les données récupérées
     const processDetailData = async (detailData: IDataObject): Promise<IDataObject> => {
       const linkedData = await fetchLinkedData(
         detailData,
@@ -276,6 +287,7 @@ export class Glpi implements INodeType {
         cache
       );
 
+			// Récupération des données liées
       const modelData: IDataObject = (linkedData.ComputerModel || {}) as IDataObject;
       const typeData: IDataObject = (linkedData.ComputerType || {}) as IDataObject;
       const stateData: IDataObject = (linkedData.State || {}) as IDataObject;
@@ -283,6 +295,7 @@ export class Glpi implements INodeType {
       const locationData: IDataObject = (linkedData.Location || {}) as IDataObject;
 			const infocomData: IDataObject[] = (linkedData.Infocom || []) as IDataObject[];
 
+			// Traitement des données récupérées et mise en forme en sortie
       let processedData: IDataObject = {
         "ID": detailData.id,
         "Nom": detailData.name,
@@ -293,29 +306,37 @@ export class Glpi implements INodeType {
         "Statut": safeGet(stateData, 'name'),
         "Emplacement": safeGet(locationData, 'name'),
         "value": safeGet(Array.isArray(infocomData) && infocomData.length > 0 ? infocomData[0] : {}, 'value'),
+				"Bon de livraison": safeGet(Array.isArray(infocomData) && infocomData.length > 0 ? infocomData[0] : {}, 'delivery_number'),
 
       };
 
-			// Inside processDetailData function, after fetching linkedData
+			/**
+			 * Pour les champs ayant des valeurs multiples, on les traite séparément
+			 * Ex: RAM, Carte graphique, Processeur, etc
+			 *  */
+
+			// Carte graphique - traitement des données liées
       const graphicsCardDetailsRaw = linkedData.DeviceGraphicCardDetails || [];
       const graphicsCardDetails: IDataObject[] = Array.isArray(graphicsCardDetailsRaw) ? graphicsCardDetailsRaw : [];
       let graphicsCardDesignations: { [designation: string]: number } = {};
 
+			// Compter les désignations de carte graphique
       graphicsCardDetails.forEach((detail: IDataObject) => {
         const designation = safeGet(detail, 'designation');
         if (designation) {
-          graphicsCardDesignations[designation] = (graphicsCardDesignations[designation] || 0) + 1;
+          graphicsCardDesignations[designation] = (graphicsCardDesignations[designation] || 0) + 1; // Incrémenter le compteur pour cette désignation
         }
       });
 
+			// Formater les désignations de carte graphique
 			let formattedGraphicsCardDesignations = '';
 			for (const [designation, count] of Object.entries(graphicsCardDesignations)) {
-				formattedGraphicsCardDesignations += `${designation}${count > 1 ? ` (x${count})` : ''}\n`;
+				formattedGraphicsCardDesignations += `${designation}${count > 1 ? ` (x${count})` : ''}\n`; // Formater la désignation et ajouter le nombre de fois qu'elle apparait
 			}
 
 			processedData['Carte graphique'] = formattedGraphicsCardDesignations.trim();
 
-			// Inside processDetailData function, after fetching linkedData
+			// RAM - traitement des données liées
       const memoryDetailsRaw = linkedData.DeviceMemoryDetails || [];
       const memoryDetails: IDataObject[] = Array.isArray(memoryDetailsRaw) ? memoryDetailsRaw : [];
       let memoryDesignations: { [designation: string]: number } = {};
@@ -323,18 +344,19 @@ export class Glpi implements INodeType {
       memoryDetails.forEach((detail: IDataObject) => {
         const designation = safeGet(detail, 'designation');
         if (designation) {
-          memoryDesignations[designation] = (memoryDesignations[designation] || 0) + 1;
+          memoryDesignations[designation] = (memoryDesignations[designation] || 0) + 1; // Incrémenter le compteur pour cette désignation
         }
       });
 
+			// Formater les désignations de RAM
 			let formattedMemoryDesignations = '';
 			for (const [designation, count] of Object.entries(memoryDesignations)) {
-				formattedMemoryDesignations += `${designation}${count > 1 ? ` (x${count})` : ''}\n`;
+				formattedMemoryDesignations += `${designation}${count > 1 ? ` (x${count})` : ''}\n`; // Formater la désignation et ajouter le nombre de fois qu'elle apparait
 			}
 
 			processedData['Type RAM'] = formattedMemoryDesignations.trim();
 
-			// Inside processDetailData function, after fetching linkedData
+			// Processor - traitement des données liées
 			const processorDetailsRaw = linkedData.DeviceProcessorDetails || [];
 			const processorDetails: IDataObject[] = Array.isArray(processorDetailsRaw) ? processorDetailsRaw : [];
 			const processorManufacturerData: IDataObject = (linkedData.ProcessorManufacturer || {}) as IDataObject;
@@ -344,12 +366,12 @@ export class Glpi implements INodeType {
 			processorDetails.forEach((detail: IDataObject) => {
 				const designation = safeGet(detail, 'designation');
 				if (designation) {
-					processorDesignations[designation] = (processorDesignations[designation] || 0) + 1;
+					processorDesignations[designation] = (processorDesignations[designation] || 0) + 1; // Incrémenter le compteur pour cette désignation
 				}
 
 				 let frequencyValue = Number(safeGet(detail, 'frequence'));
 
-				// If frequency is not valid, try to extract from designation
+				// Si la fréquence est NaN ou <= 0, essayer de l'extraire d'une chaîne (dans la designation)
 				if (isNaN(frequencyValue) || frequencyValue <= 0) {
 					const frequencyMatch = designation.match(/(\d+\.?\d*)\s*(GHz|MHz|Ghz|Mhz)/i);
 					if (frequencyMatch) {
@@ -358,33 +380,35 @@ export class Glpi implements INodeType {
 						frequencyValue = frequencyUnit === 'GHz' ? frequencyValue * 1000 : frequencyValue;
 					}
 				}
+				// Ajouter la fréquence à la liste si elle est valide
 				if (!isNaN(frequencyValue) && frequencyValue > 0) {
 					processorFrequencies.push(frequencyValue);
 				}
 			});
 
-			// Filter out frequencies that are 0 or undefined
+			// Exclure les fréquences nulles ou négatives
 			const validFrequencies = processorFrequencies.filter(freq => freq > 0);
 
-			// Determine the smallest frequency
+			// Determine la plus petite fréquence valide
 			let smallestFrequency = validFrequencies.length > 0 ? Math.min(...validFrequencies) : 0;
 			let frequencyUnit = smallestFrequency > 20 ? 'MHz' :
 				smallestFrequency === 0 ? '' : 'GHz';
 			let formattedFrequency = smallestFrequency > 0 ? `${smallestFrequency}${frequencyUnit}` : 'No valid frequency found';
 
-			// Format processor designations
+			// Formater les désignations de processeur
 			let formattedProcessorDesignations = '';
 			for (const [designation, count] of Object.entries(processorDesignations)) {
-				formattedProcessorDesignations += `${designation}${count > 1 ? ` (x${count})` : ''}\n`;
+				formattedProcessorDesignations += `${designation}${count > 1 ? ` (x${count})` : ''}\n`; // Formater la désignation et ajouter le nombre de fois qu'elle apparait
 			}
 			processedData['Type Processeur'] = formattedProcessorDesignations.trim();
 			processedData['Marque Processeur'] = safeGet(processorManufacturerData, 'name');
 			processedData['Vitesse Processeur'] = formattedFrequency;
 
-      // Fetch plugin fields data efficiently using cached data
+      // Récupération des champs de plugin customisés du plugin Fields (FicheTest)
       const pluginFieldsUrl = `${apiUrl}/PluginFieldsComputerFichetest?range=0-9999`;
       const pluginFieldsData = await fetchDataWithCache(pluginFieldsUrl, 'PluginFields');
 
+			// Traitement des données liées
       if (pluginFieldsData && Array.isArray(pluginFieldsData)) {
         const fieldData = pluginFieldsData.find(field => field.items_id === detailData.id);
 
@@ -398,6 +422,7 @@ export class Glpi implements INodeType {
           const hasSerialPort = String(fieldData.portsriefield).includes('1') ? 'Oui' : 'Non';
 					const screenSize = Number(safeGet(fieldData, 'tailledelcranfield'));
 
+					// Ajout des champs traités à processedData
           processedData['Webcam'] = hasWebcam;
           processedData['WiFi'] = safeGet(fieldData, 'wififield');
           processedData['Bluetooth'] = hasBluetooth;
@@ -416,7 +441,7 @@ export class Glpi implements INodeType {
       return processedData;
     };
 
-    // Process items in batches for better performance
+    // Fonction pour traiter les données par lots
     const processBatch = async (items: IDataObject[]): Promise<IDataObject[]> => {
       const promises = items.map(async (item) => {
         const itemId = item.id;
@@ -435,7 +460,7 @@ export class Glpi implements INodeType {
       );
     };
 
-    // NOUVEAU CODE: Trouver les IDs correspondant à une valeur spécifique dans une entité liée
+    // Trouver les IDs correspondant à une valeur spécifique dans une entité liée
     const getMatchingEntityIds = async (entityType: string, fieldName: string, fieldValue: string): Promise<Set<number>> => {
       const matchingIds = new Set<number>();
       const entityData = await fetchDataWithCache(`${apiUrl}/${entityType}?expand_dropdowns=true&range=0-9999`, entityType);
@@ -454,7 +479,7 @@ export class Glpi implements INodeType {
       return matchingIds;
     };
 
-    // NOUVEAU CODE: Préfiltrer les ordinateurs pour ne récupérer que ceux qui correspondent aux filtres
+    // Préfiltrer les ordinateurs pour ne récupérer que ceux qui correspondent aux filtres
     const getFilteredComputerIds = async (): Promise<Set<number>> => {
       if (filters.length === 0) return new Set<number>(); // Pas de filtres
 
@@ -464,7 +489,7 @@ export class Glpi implements INodeType {
       for (const filter of filters) {
         const { filterField, filterValue } = filter;
 
-        // Correspondance directe des champs courants
+        // Correspondance sur nom
         if (filterField === 'Nom' || filterField === 'name') {
           const computers = await fetchDataWithCache(`${apiUrl}/Computer?searchText[name]=${encodeURIComponent(filterValue)}`, 'FilteredComputers');
           if (Array.isArray(computers)) {
@@ -558,11 +583,29 @@ export class Glpi implements INodeType {
             allMatchingSets.push(matchingIds);
           }
         }
+				/**
+				 * Exemple de filtre sur un champ
+				 * else if (filterField === 'Field' || filterField === 'field' || filterField === 'Custom field') { // Filtrer par champ personnalisé
+				 * 	const customFieldIds = await getMatchingEntityIds('Field', 'name', filterValue); // Récupérer les IDs des champs personnalisés
+				 * 	if (customFieldIds.size > 0) { // Si des IDs sont trouvées
+				 * 		const matchingIds = new Set<number>();	// Créer un ensemble pour stocker les IDs correspondants
+				 * 		const computers = await fetchDataWithCache(`${apiUrl}/Computer?range=0-9999`, 'AllComputers'); // Récupérer tous les ordinateurs
+				 * 		if (Array.isArray(computers)) { // Vérifier si la réponse est un tableau
+				 * 			computers.forEach(comp => { // Pour chaque ordinateur
+				 * 				if (customFieldIds.has(Number(comp.customfields_id))) { // Vérifier si l'ID du champ personnalisé correspond au champ de l'ordinateur
+				 * 					matchingIds.add(Number(comp.id)); // Ajouter l'ID de l'ordinateur à l'ensemble
+				 * 				}
+				 * 			});
+				 * 		}
+				 * 		allMatchingSets.push(matchingIds); // Ajouter l'ensemble d'IDs correspondants à la liste
+				 * 	}
+				 * }
+				 */
       }
 
       // Si nous n'avons trouvé aucune correspondance pour les filtres
       if (allMatchingSets.length === 0) {
-        return new Set<number>();
+        return new Set<number>(); // Aucun ID trouvé
       }
 
       // Intersection de tous les ensembles d'IDs correspondants (AND logique)
@@ -585,17 +628,18 @@ export class Glpi implements INodeType {
     };
 
     try {
-      // Start prefetching common data early
+      // Récupérer les données communes avant de commencer
       prefetchCommonData();
 
+			// Si un ID est fourni, récupérer les détails de cet ID
       if (id !== undefined && id !== null) {
-        const detailData = await fetchDataWithCache(`${apiUrl}/${resource}/${id}?expand_dropdowns=true`, 'ComputerDetail');
+        const detailData = await fetchDataWithCache(`${apiUrl}/${resource}/${id}?expand_dropdowns=true`, 'ComputerDetail'); // Récupérer les données de l'ordinateur
 
-        if (!detailData) throw new NodeApiError(this.getNode(), detailData, { message: `No data found for ID ${id}` });
-        const processed = await processDetailData(detailData);
+        if (!detailData) throw new NodeApiError(this.getNode(), detailData, { message: `No data found for ID ${id}` }); // Vérifier si les données existent
+        const processed = await processDetailData(detailData); // Traiter les données récupérées
         results.push(processed);
       } else {
-        // NOUVEAU CODE: Filtrer d'abord par les critères fournis
+        // Filtrer d'abord par les critères fournis
         let computerIdsToProcess: number[] = [];
 
         if (filters.length > 0) {
@@ -619,7 +663,7 @@ export class Glpi implements INodeType {
           for (let i = 0; i < computerIdsToProcess.length; i += batchSize) {
             const batchIds = computerIdsToProcess.slice(i, i + batchSize);
             const batchItems = await Promise.all(batchIds.map(async (itemId) => {
-              return fetchDataWithCache(`${apiUrl}/${resource}/${itemId}`, `ComputerDetail-${itemId}`);
+              return fetchDataWithCache(`${apiUrl}/${resource}/${itemId}`, `ComputerDetail-${itemId}`); // Récupérer les données de l'ordinateur
             }));
 
             const batchResults = await processBatch(batchItems.filter(item => item !== null && typeof item === 'object'));
@@ -632,7 +676,7 @@ export class Glpi implements INodeType {
           const step = 50; // Increased batch size for efficiency
 
           do {
-            const response = await fetchDataWithCache(`${apiUrl}/${resource}?expand_dropdowns=true&range=${start}-${start + step - 1}`, 'ComputerList');
+            const response = await fetchDataWithCache(`${apiUrl}/${resource}?expand_dropdowns=true&range=${start}-${start + step - 1}`, 'ComputerList'); 	// Récupérer la liste des ordinateurs
 
             if (!Array.isArray(response) || response.length === 0) {
               continueLooping = false;
@@ -642,14 +686,14 @@ export class Glpi implements INodeType {
             const limitedResponse = returnAll ? response : response.slice(0, limit - results.length);
             if (limitedResponse.length === 0) break;
 
-            // Process in batches for better performance
+            // Traiter ces ordinateurs par lots
             const batchSize = Math.min(maxConcurrentRequests * 2, 20);
             for (let i = 0; i < limitedResponse.length; i += batchSize) {
               const batch = limitedResponse.slice(i, i + batchSize);
               const batchResults = await processBatch(batch);
               results.push(...batchResults);
 
-              // Check if we've reached the limit
+              // Vérifier si on a atteint la limite
               if (!returnAll && results.length >= limit) {
                 continueLooping = false;
                 break;
@@ -665,6 +709,7 @@ export class Glpi implements INodeType {
         }
       }
     } finally {
+			// Fermer la session
       try {
         await this.helpers.request({
           method: 'GET' as IHttpRequestMethods,
